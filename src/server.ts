@@ -11,6 +11,19 @@ import {
 } from "ai";
 import { z } from "zod";
 
+interface JoobleJob {
+  title: string;
+  company: string;
+  location: string;
+  salary?: string;
+  link: string;
+}
+
+interface JoobleResponse {
+  totalCount: number;
+  jobs: JoobleJob[];
+}
+
 export class ChatAgent extends AIChatAgent<Env> {
   maxPersistedMessages = 100;
   chatRecovery = true;
@@ -177,7 +190,44 @@ If the user asks to schedule a task, use the schedule tool to schedule the task.
               return `Error cancelling task: ${error}`;
             }
           }
-        })
+        }),
+
+        searchJobs: tool({
+          description: "Search for job listings by keywords and location using Jooble",
+          inputSchema: z.object({
+            keywords: z.string().describe("Job title or keywords, e.g. 'data engineer'"),
+            location: z.string().optional().describe("City or region to search in"),
+            page: z.number().optional().describe("Results page number, defaults to 1"),
+          }),
+          execute: async ({ keywords, location, page }) => {
+            const res = await fetch(`https://jooble.org/api/${this.env.JOOBLE_API_KEY}`, {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({ keywords, location, page }),
+            });
+
+            if (!res.ok) {
+              return { error: `Jooble API error: ${res.status}` };
+            }
+
+            const data = (await res.json()) as JoobleResponse;
+            // Trim down to the essentials so the model isn't flooded with raw HTML/snippets
+            return {
+              totalCount: data.totalCount,
+              jobs: (data.jobs ?? []).slice(0, 10).map((job: any) => ({
+                title: job.title,
+                company: job.company,
+                location: job.location,
+                salary: job.salary,
+                link: job.link,
+              })),
+            };
+          },
+        }),
+
+
+
+
       },
       stopWhen: stepCountIs(20),
       abortSignal: options?.abortSignal

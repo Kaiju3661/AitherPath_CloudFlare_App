@@ -4,6 +4,7 @@
 interface __BaseEnv_Env {
 	AI: Ai;
 	ChatAgent: DurableObjectNamespace<import("./src/server").ChatAgent>;
+    JOOBLE_API_KEY: string;
 }
 declare namespace Cloudflare {
 	interface GlobalProps {
