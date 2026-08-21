@@ -10,6 +10,7 @@ import {
   tool
 } from "ai";
 import { z } from "zod";
+import { getAgentByName } from "agents";
 
 interface JoobleJob {
   title: string;
@@ -24,13 +25,23 @@ interface JoobleResponse {
   jobs: JoobleJob[];
 }
 
-export class ChatAgent extends AIChatAgent<Env> {
+interface ChatState {
+  googleTokens?: {
+    accessToken: string;
+    refreshToken?: string;
+    expiresAt: number;
+  };
+}
+
+export class ChatAgent extends AIChatAgent<Env, ChatState> {
   maxPersistedMessages = 100;
   chatRecovery = true;
   // Wait for MCP connections to be re-established after hibernation before
   // processing a message, so MCP tools aren't intermittently missing.
   waitForMcpConnections = true;
 
+  initialState: ChatState = {};
+  
   onStart() {
     // Configure OAuth popup behavior for MCP servers that require authentication
     this.mcp.configureOAuthCallback({
@@ -48,6 +59,84 @@ export class ChatAgent extends AIChatAgent<Env> {
       }
     });
   }
+
+  storeGoogleTokens(tokens: { access_token: string; refresh_token?: string; expires_in: number }) {
+    this.setState({
+      ...this.state,
+      googleTokens: {
+        accessToken: tokens.access_token,
+        refreshToken: tokens.refresh_token ?? this.state.googleTokens?.refreshToken,
+        expiresAt: Date.now() + tokens.expires_in * 1000,
+      },
+    });
+  }
+
+  @callable()
+  async getGoogleTokenStatus() {
+    const tokens = this.state.googleTokens;
+    if (!tokens) return { connected: false };
+    return {
+      connected: true,
+      hasRefreshToken: !!tokens.refreshToken,
+      expiresAt: new Date(tokens.expiresAt).toISOString(),
+      isExpired: Date.now() > tokens.expiresAt,
+    };
+  }
+
+  async disconnectGoogle() {
+    const tokens = this.state.googleTokens;
+
+    // Best-effort revoke with Google — doesn't block clearing local state if it fails
+    if (tokens?.refreshToken) {
+      try {
+        await fetch("https://oauth2.googleapis.com/revoke", {
+          method: "POST",
+          headers: { "Content-Type": "application/x-www-form-urlencoded" },
+          body: new URLSearchParams({ token: tokens.refreshToken }),
+        });
+      } catch (e) {
+        console.error("Failed to revoke Google token:", e);
+      }
+    }
+
+    this.setState({ ...this.state, googleTokens: undefined });
+}
+
+  async getValidAccessToken(): Promise<string> {
+  const tokens = this.state.googleTokens;
+  if (!tokens) throw new Error("Not connected to Google. Please authorize first.");
+
+  const isExpired = Date.now() > tokens.expiresAt - 60_000; // refresh 1 min early
+  if (!isExpired) return tokens.accessToken;
+
+  if (!tokens.refreshToken) {
+    throw new Error("Access token expired and no refresh token available. Please reauthorize.");
+  }
+
+  const res = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      client_id: this.env.GOOGLE_CLIENT_ID,
+      client_secret: this.env.GOOGLE_CLIENT_SECRET,
+      refresh_token: tokens.refreshToken,
+      grant_type: "refresh_token",
+    }),
+  });
+
+  if (!res.ok) {
+    throw new Error(`Token refresh failed: ${res.status}`);
+  }
+
+  const data = (await res.json()) as { access_token: string; expires_in: number };
+  this.storeGoogleTokens({
+    access_token: data.access_token,
+    refresh_token: tokens.refreshToken, // refresh responses don't resend it
+    expires_in: data.expires_in,
+  });
+
+  return data.access_token;
+}
 
   @callable()
   async addServer(name: string, url: string) {
@@ -225,8 +314,101 @@ If the user asks to schedule a task, use the schedule tool to schedule the task.
           },
         }),
 
+        listInbox: tool({
+          description: "List recent emails from the user's Gmail inbox",
+          inputSchema: z.object({
+            maxResults: z.number().optional().describe("Number of emails to fetch, defaults to 10"),
+          }),
+          execute: async ({ maxResults = 10 }) => {
+            const accessToken = await this.getValidAccessToken();
 
+            const listRes = await fetch(
+              `https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=${maxResults}`,
+              { headers: { Authorization: `Bearer ${accessToken}` } }
+            );
+            if (!listRes.ok) return { error: `Gmail list error: ${listRes.status}` };
 
+            const listData = (await listRes.json()) as { messages?: { id: string }[] };
+            if (!listData.messages) return { emails: [] };
+
+            // Fetch metadata (subject/from) for each message
+            const emails = await Promise.all(
+              listData.messages.map(async (msg) => {
+                const msgRes = await fetch(
+                  `https://gmail.googleapis.com/gmail/v1/users/me/messages/${msg.id}?format=metadata&metadataHeaders=Subject&metadataHeaders=From`,
+                  { headers: { Authorization: `Bearer ${accessToken}` } }
+                );
+                const msgData = (await msgRes.json()) as {
+                  id: string;
+                  snippet: string;
+                  payload: { headers: { name: string; value: string }[] };
+                };
+                const headers = msgData.payload?.headers ?? [];
+                return {
+                  id: msgData.id,
+                  subject: headers.find((h) => h.name === "Subject")?.value ?? "(no subject)",
+                  from: headers.find((h) => h.name === "From")?.value ?? "(unknown)",
+                  snippet: msgData.snippet,
+                };
+              })
+            );
+
+            return { emails };
+          },
+        }),
+
+        sendEmail: tool({
+          description: "Send an email from the user's Gmail account",
+          inputSchema: z.object({
+            to: z.string().describe("Recipient email address"),
+            subject: z.string().describe("Email subject line"),
+            body: z.string().describe("Email body text"),
+          }),
+          needsApproval: async () => true, // always confirm before sending — irreversible action
+          execute: async ({ to, subject, body }) => {
+            const accessToken = await this.getValidAccessToken();
+
+            const message = [`To: ${to}`, `Subject: ${subject}`, "Content-Type: text/plain; charset=utf-8", "", body].join("\n");
+            const encoded = btoa(message).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+
+            const res = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/messages/send", {
+              method: "POST",
+              headers: {
+                Authorization: `Bearer ${accessToken}`,
+                "Content-Type": "application/json",
+              },
+              body: JSON.stringify({ raw: encoded }),
+            });
+
+            if (!res.ok) {
+              const errText = await res.text();
+              return { error: `Gmail send error: ${res.status} — ${errText}` };
+            }
+
+            return { success: true, to, subject };
+          },
+        }),
+
+        connectGmail: tool({
+          description: "Provide the user a link to authorize Gmail access when they want to connect their Google account or if a Gmail tool fails due to missing authorization",
+          inputSchema: z.object({}),
+          execute: async () => {
+            return {
+              message: "Click this link to connect your Gmail account",
+              url: `${this.env.APP_URL}/oauth/login?agent=${this.name}`,
+            };
+          },
+        }),
+
+        disconnectGmail: tool({
+          description: "Disconnect the user's Gmail account, revoking access and forgetting stored credentials",
+          inputSchema: z.object({}),
+          needsApproval: async () => true, // confirm before revoking access
+          execute: async () => {
+            await this.disconnectGoogle();
+            return { message: "Gmail account disconnected." };
+          },
+        }),
 
       },
       stopWhen: stepCountIs(20),
@@ -254,8 +436,67 @@ If the user asks to schedule a task, use the schedule tool to schedule the task.
   }
 }
 
+function getGoogleAuthUrl(env: Env, agentName: string) {
+  const params = new URLSearchParams({
+    client_id: env.GOOGLE_CLIENT_ID,
+    redirect_uri: env.GOOGLE_REDIRECT_URI,
+    response_type: "code",
+    scope: "https://www.googleapis.com/auth/gmail.readonly https://www.googleapis.com/auth/gmail.send",
+    access_type: "offline",
+    prompt: "consent",
+    state: agentName,
+  });
+  return `https://accounts.google.com/o/oauth2/v2/auth?${params}`;
+}
+
+async function handleOAuthCallback(request: Request, env: Env) {
+  const url = new URL(request.url);
+  const code = url.searchParams.get("code");
+  const agentName = url.searchParams.get("state");
+
+  if (!code || !agentName) {
+    return new Response("Missing code or state", { status: 400 });
+  }
+
+  const tokenRes = await fetch("https://oauth2.googleapis.com/token", {
+    method: "POST",
+    headers: { "Content-Type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams({
+      code,
+      client_id: env.GOOGLE_CLIENT_ID,
+      client_secret: env.GOOGLE_CLIENT_SECRET,
+      redirect_uri: env.GOOGLE_REDIRECT_URI,
+      grant_type: "authorization_code",
+    }),
+  });
+
+  const tokens = await tokenRes.json() as {
+    access_token: string;
+    refresh_token?: string;
+    expires_in: number;
+  };
+
+  const agent = await getAgentByName(env.ChatAgent, agentName);
+  await agent.storeGoogleTokens(tokens);
+
+  return new Response("Authorized! You can close this tab.");
+}
+
 export default {
   async fetch(request: Request, env: Env) {
+
+    const url = new URL(request.url);
+
+    if (url.pathname === "/oauth/login") {
+      const agentName = url.searchParams.get("agent");
+      if (!agentName) return new Response("Missing agent name", { status: 400 });
+      return Response.redirect(getGoogleAuthUrl(env, agentName), 302);
+    }
+
+    if (url.pathname === "/oauth/callback") {
+      return handleOAuthCallback(request, env);
+    }
+
     return (
       (await routeAgentRequest(request, env)) ||
       new Response("Not found", { status: 404 })

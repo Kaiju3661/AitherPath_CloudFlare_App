@@ -127,6 +127,26 @@ function ToolPartView({
   const toolName = getToolName(part);
 
   // Completed
+  if (part.state === "output-available" && toolName === "connectGmail") {
+    const output = part.output as { message: string; url: string };
+    return (
+      <div className="flex justify-start">
+        <Surface className="max-w-[85%] px-4 py-3 rounded-xl ring ring-kumo-line">
+          <Text size="sm" className="mb-2 block">
+            {output.message}
+          </Text>
+          <Button
+            variant="primary"
+            size="sm"
+            onClick={() => window.open(output.url, "_blank")}
+          >
+            Connect Gmail
+          </Button>
+        </Surface>
+      </div>
+    );
+  }
+  
   if (part.state === "output-available") {
     return (
       <div className="flex justify-start">
